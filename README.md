@@ -1,1 +1,1 @@
-# MiniChat
+# LingLong LLM
