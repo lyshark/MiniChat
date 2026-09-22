@@ -1,1 +1,1 @@
-# LingLong LLM
+# 玄鉴（Mystic Mirror LLM）
