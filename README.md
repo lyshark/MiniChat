@@ -1,1 +1,1 @@
-# 玄鉴（Mystic Mirror LLM）
+玄鉴（Mystic Mirror LLM）是一套基于 PyTorch 实现的 Decoder‑Only 因果大模型网络本体，参考主流 LLaMA 技术路线，完整实现模型骨干组件，同时支持稠密 Transformer 与 MoE 混合专家两种架构。本代码仅聚焦神经网络本身，实现模型前向计算、损失函数、基础自回归生成逻辑，不包含分词器、数据集处理、分布式训练调度、高性能推理调度引擎，可对接 HuggingFace 生态完成模型训练与基础推理。
