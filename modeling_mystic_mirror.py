@@ -356,7 +356,7 @@ def unpack_past_cache(past_key_values, num_layers: int):
 # ============================================================
 
 class Attention(nn.Module):
-    def __init__(self, config: ChatConfig):
+    def __init__(self, config: MysticMirrorConfig):
         super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         self.n_local_heads = config.num_attention_heads
@@ -442,7 +442,7 @@ class Attention(nn.Module):
         return output, present_kv
 
 class FeedForward(nn.Module):
-    def __init__(self, config: ChatConfig, intermediate_size: int = None):
+    def __init__(self, config: MysticMirrorConfig, intermediate_size: int = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
@@ -510,7 +510,7 @@ class MOEFeedForward(nn.Module):
         return y.view(batch_size, seq_len, hidden_dim), aux_loss
 
 class MysticMirrorBlock(nn.Module):
-    def __init__(self, layer_id: int, config: ChatConfig):
+    def __init__(self, layer_id: int, config: MysticMirrorConfig):
         super().__init__()
         self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -551,7 +551,7 @@ class MysticMirrorBlock(nn.Module):
 # ============================================================
 
 class MysticMirrorModel(nn.Module):
-    def __init__(self, config: ChatConfig):
+    def __init__(self, config: MysticMirrorConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -560,7 +560,7 @@ class MysticMirrorModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([
-            ChatBlock(l, config) for l in range(self.num_hidden_layers)
+            MysticMirrorBlock(l, config) for l in range(self.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -693,13 +693,13 @@ class MysticMirrorModel(nn.Module):
 # ============================================================
 
 class MysticMirrorForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = ChatConfig
+    config_class = MysticMirrorConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: ChatConfig = None):
-        self.config = config or ChatConfig()
+    def __init__(self, config: MysticMirrorConfig = None):
+        self.config = config or MysticMirrorConfig()
         super().__init__(self.config)
-        self.model = ChatModel(self.config)
+        self.model = MysticMirrorModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.post_init()
 
