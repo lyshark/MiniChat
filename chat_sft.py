@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-MysticMirror 预训练模型续写 / 对话脚本（命令行参数启动）
-========================================================
+MysticMirror SFT 模型对话脚本（命令行参数启动）
+===============================================
 
 用法示例：
-    python chat_pretrain.py
-    python chat_pretrain.py --model_path ./pretrain_output/best_pretrain
-    python chat_pretrain.py --model_path ./pretrain_output/final_pretrain \
+    python chat_sft.py
+    python chat_sft.py --model_path ./sft_output/best_sft
+    python chat_sft.py --model_path ./sft_output/best_sft \
         --device cuda --dtype bf16 --max_new_tokens 512 --temperature 0.8
-    python chat_pretrain.py --greedy --max_new_tokens 64
+    python chat_sft.py --greedy --no_history
+
+与训练模板保持一致：<|im_start|>user\\n{输入}<|im_end|>\\n<|im_start|>assistant\\n
 """
 import argparse
 import os
@@ -71,12 +73,12 @@ def _prob_float(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="MysticMirror 预训练模型续写 / 对话脚本",
+        description="MysticMirror SFT 模型对话脚本",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # ---------- 模型与运行环境 ----------
     parser.add_argument(
-        "--model_path", type=str, default="./pretrain_output/best_pretrain",
+        "--model_path", type=str, default="./sft_output/best_sft",
         help="模型目录（须包含 config.json、model.safetensors 及 tokenizer 文件）",
     )
     parser.add_argument(
@@ -92,7 +94,7 @@ def parse_args(argv=None):
     )
     # ---------- 生成参数 ----------
     parser.add_argument(
-        "--max_new_tokens", type=_positive_int, default=256, help="最多生成的新 token 数（>0）",
+        "--max_new_tokens", type=_positive_int, default=512, help="最多生成的新 token 数（>0）",
     )
     parser.add_argument(
         "--temperature", type=_nonneg_float, default=0.7, help="采样温度（>=0）",
@@ -104,11 +106,15 @@ def parse_args(argv=None):
         "--top_k", type=_nonneg_int, default=50, help="top-k 采样个数（0 表示关闭）",
     )
     parser.add_argument(
-        "--repetition_penalty", type=_positive_float, default=1.1, help="重复惩罚系数（>0）",
+        "--repetition_penalty", type=_positive_float, default=1.0, help="重复惩罚系数（>0）",
     )
     parser.add_argument(
         "--greedy", action="store_true",
         help="贪心解码（关闭随机采样，等效 temperature=0）",
+    )
+    parser.add_argument(
+        "--no_history", action="store_true",
+        help="关闭多轮历史，每轮独立单轮对话（等价于原脚本行为）",
     )
     parser.add_argument(
         "--max_prompt_len", type=_positive_int, default=None,
@@ -166,16 +172,19 @@ def load_model(model_path, device, dtype):
     )
     return model, tokenizer
 
-class MysticMirror:
-    """预训练续写引擎：维护历史上下文，并做 token 级窗口裁剪。
-    """
+class MysticMirrorChat:
+    USER_PREFIX = "<|im_start|>user\n"
+    ASSISTANT_PREFIX = "<|im_start|>assistant\n"
+    TURN_END = "<|im_end|>\n"
+    GEN_PROMPT = ASSISTANT_PREFIX
+    _HISTORY_HEADROOM = 64
 
     def __init__(self, model, tokenizer, device, args):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.args = args
-        self.history_ids = []
+        self.history_turns = []
 
         max_pos = model.config.max_position_embeddings
         if args.max_new_tokens <= 0:
@@ -189,29 +198,67 @@ class MysticMirror:
         self.max_prompt_len = args.max_prompt_len or auto_budget
         if self.max_prompt_len <= 0:
             raise ValueError(f"max_prompt_len 必须 > 0，得到 {self.max_prompt_len}")
-        # 即使手动调大 max_prompt_len，也不允许突破“提示+生成”的总长限制
         self.max_prompt_len = min(self.max_prompt_len, auto_budget)
 
-    def generate(self, user_input):
-        inp_ids = self.tokenizer.encode(user_input, add_special_tokens=False)
+    def _render_history(self):
+        """把已完成的对话轮次渲染成模板文本（不含当前输入）。"""
+        parts = []
+        for user_text, assistant_text in self.history_turns:
+            parts.append(f"{self.USER_PREFIX}{user_text}{self.TURN_END}")
+            parts.append(f"{self.ASSISTANT_PREFIX}{assistant_text}{self.TURN_END}")
+        return "".join(parts)
 
-        # 当前输入本身超长时只保留其尾部
-        if len(inp_ids) > self.max_prompt_len:
-            inp_ids = inp_ids[-self.max_prompt_len:]
+    def _render(self, user_input):
+        """把历史 + 当前输入渲染成对话模板文本。"""
+        return (
+            self._render_history()
+            + f"{self.USER_PREFIX}{user_input}{self.TURN_END}"
+            + self.GEN_PROMPT
+        )
 
-        budget = self.max_prompt_len - len(inp_ids)
-        if budget <= 0:
-            self.history_ids = []
-        elif len(self.history_ids) > budget:
-            self.history_ids = self.history_ids[-budget:]
+    def _prune_history(self):
+        """历史部分自身不超出预算，为新一轮输入预留头部空间。
 
-        prompt_ids = self.history_ids + inp_ids
+        单轮文本比预算还长时，该轮会被整体丢弃（避免死循环）。
+        """
+        budget = max(self.max_prompt_len - self._HISTORY_HEADROOM, 0)
+        while self.history_turns:
+            hist_ids = self.tokenizer.encode(
+                self._render_history(), add_special_tokens=False
+            )
+            if len(hist_ids) <= budget:
+                break
+            self.history_turns.pop(0)
+
+    def _build_prompt_ids(self, user_input):
+        """构造 prompt 的 token ids；超长时优先丢轮次，再退化为 token 级裁剪。"""
+        for _ in range(len(self.history_turns) + 32):
+            prompt = self._render(user_input)
+            ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            if len(ids) <= self.max_prompt_len:
+                return ids
+            if self.history_turns and not self.args.no_history:
+                self.history_turns.pop(0)
+                continue
+            inp_ids = self.tokenizer.encode(user_input, add_special_tokens=False)
+            overhead = len(ids) - len(inp_ids)
+            keep = self.max_prompt_len - overhead
+            if keep <= 0:
+                return ids[-self.max_prompt_len:]
+            user_input = self.tokenizer.decode(inp_ids[-keep:], skip_special_tokens=True)
+        return self.tokenizer.encode(self._render(user_input),
+                                     add_special_tokens=False)[-self.max_prompt_len:]
+
+    def chat(self, user_input):
+        user_input = user_input.strip()
+        if not user_input:
+            raise ValueError("输入不能为空！")
+
+        prompt_ids = self._build_prompt_ids(user_input)
         prompt_tensor = torch.tensor(
             [prompt_ids], dtype=torch.long, device=self.device
         )
         input_len = prompt_tensor.shape[-1]
-
-        # generate 本身带 torch.inference_mode()，无需再包 no_grad
         outputs = self.model.generate(
             input_ids=prompt_tensor,
             max_new_tokens=self.args.max_new_tokens,
@@ -228,12 +275,13 @@ class MysticMirror:
         response = self.tokenizer.decode(new_ids, skip_special_tokens=True)
         response = _BUFFER_RE.sub("", response).strip()
 
-        # 更新历史（仅保留最近 max_prompt_len 个 token）
-        self.history_ids = (prompt_ids + new_ids)[-self.max_prompt_len:]
+        if not self.args.no_history:
+            self.history_turns.append((user_input, response))
+            self._prune_history()
         return response
 
     def __call__(self, user_input):
-        return self.generate(user_input)
+        return self.chat(user_input)
 
 def main(argv=None):
     args = parse_args(argv)
@@ -243,26 +291,28 @@ def main(argv=None):
     device = resolve_device(args)
     dtype = resolve_dtype(args, device)
     model, tokenizer = load_model(args.model_path, device, dtype)
-    engine = MysticMirror(model, tokenizer, device, args)
+    engine = MysticMirrorChat(model, tokenizer, device, args)
 
-    print("\n输入 exit / quit 退出；直接回车表示基于已有历史继续续写。\n")
+    history_note = "已开启多轮历史" if not args.no_history else "单轮模式（无历史）"
+    print(f"\n模型加载完成，可以开始对话（{history_note}）！"
+          "输入 exit / quit 退出。\n")
     while True:
         try:
-            user_input = input("请输入文本：")
+            user_input = input("User：")
         except (EOFError, KeyboardInterrupt):
             print("\n输入结束，退出。")
             break
         if user_input.strip().lower() in ("exit", "quit"):
+            print("退出对话")
             break
-        if not user_input.strip() and not engine.history_ids:
-            print("[提示] 历史为空且输入为空，请先输入一些文本。")
+        if not user_input.strip():
             continue
         try:
             response = engine(user_input)
-        except Exception as exc:  # noqa: BLE001 —— 单轮失败不中断会话
-            print(f"[错误] 本轮生成失败：{exc}")
+        except Exception as exc:
+            print(f"[错误] 本轮生成失败：{exc}\n")
             continue
-        print(f"续写结果：{response}\n")
+        print(f"Assistant：{response}\n")
     return 0
 
 if __name__ == "__main__":

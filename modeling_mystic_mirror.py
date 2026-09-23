@@ -135,6 +135,7 @@ def normalize_eos_token_id(eos_token_id, device):
 
 class MysticMirrorConfig(PretrainedConfig):
     model_type = "MysticMirror"
+    tie_word_embeddings = True
 
     def __init__(
         self,
